@@ -1,6 +1,7 @@
 const { google } = require('googleapis');
 const { sheetRanges } = require('../config/sheetRanges');
 const { jwtClient, ensureGoogleJwtAuth } = require('../config/google');
+const { sendSolicitudNotification } = require('../services/sendEmail');
 require('dotenv').config();
 
 function sheetValuesToObject(values = []) {
@@ -32,6 +33,63 @@ function buildRange(sheetName, range) {
   }
 
   return `${sheetName}!${range}`;
+}
+
+function getSolicitudUserEmail(req, solicitudRow) {
+  if (req.user?.email) {
+    return req.user.email;
+  }
+
+  if (Number.isInteger(req.body.userEmailColumnIndex)) {
+    return solicitudRow[req.body.userEmailColumnIndex] || '';
+  }
+
+  return '';
+}
+
+function formatSolicitudFechaHora(rawFecha) {
+  const now = new Date();
+
+  if (!rawFecha) {
+    return now.toLocaleString('es-CO');
+  }
+
+  const rawText = String(rawFecha).trim();
+  if (!rawText) {
+    return now.toLocaleString('es-CO');
+  }
+
+  const hasTime = /(\d{1,2}:\d{2})/.test(rawText) || /am|pm/i.test(rawText);
+  if (hasTime) {
+    return rawText;
+  }
+
+  return `${rawText} ${now.toLocaleTimeString('es-CO')}`;
+}
+
+async function getSolicitudProcesoYActividad(sheets, spreadsheetId, solicitudRow) {
+  const procesoId = String(solicitudRow[SHEET_COLUMNS.SOLICITUDES.id_proceso] ?? '').trim();
+  const actividadValue = String(
+    solicitudRow[SHEET_COLUMNS.SOLICITUDES.actividad_actual] ?? ''
+  ).trim();
+
+  const [procesosRows, actividadesRows] = await Promise.all([
+    getSheetRows(sheets, spreadsheetId, 'PROCESOS'),
+    getSheetRows(sheets, spreadsheetId, 'ACTIVIDADES'),
+  ]);
+
+  const procesos = rowsToObjectsWithColumns(procesosRows, SHEET_COLUMNS.PROCESOS);
+  const actividades = rowsToObjectsWithColumns(actividadesRows, SHEET_COLUMNS.ACTIVIDADES);
+
+  const proceso = procesos.find((item) => String(item.id ?? '').trim() === procesoId);
+  const actividad = actividades.find(
+    (item) => String(item.id ?? '').trim() === actividadValue
+  );
+
+  return {
+    procesoNombre: proceso?.nombre || (procesoId ? `ID ${procesoId}` : ''),
+    actividadNombre: actividad?.nombre || actividadValue,
+  };
 }
 
 const SHEET_COLUMNS = {
@@ -446,6 +504,33 @@ const appendSheetRow = async (req, res) => {
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: normalizedValues },
     });
+
+    if (sheetName === 'SOLICITUDES' && normalizedValues.length) {
+      const solicitudRow = normalizedValues[0];
+      const solicitudId = solicitudRow[SHEET_COLUMNS.SOLICITUDES.id] || '';
+      const userEmail = getSolicitudUserEmail(req, solicitudRow);
+      const fechaHora = formatSolicitudFechaHora(
+        solicitudRow[SHEET_COLUMNS.SOLICITUDES.fecha]
+      );
+
+      try {
+        const { procesoNombre, actividadNombre } = await getSolicitudProcesoYActividad(
+          sheets,
+          spreadsheetId,
+          solicitudRow
+        );
+
+        await sendSolicitudNotification({
+          solicitudId,
+          userEmail,
+          proceso: procesoNombre,
+          actividad: actividadNombre,
+          fechaHora,
+        });
+      } catch (emailError) {
+        console.error('Error enviando correo de solicitud:', emailError);
+      }
+    }
 
     return res.status(201).json({
       status: true,
